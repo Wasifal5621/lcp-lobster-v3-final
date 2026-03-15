@@ -634,15 +634,6 @@ L|CA|openweather|taipei|E   ← 7B 跑：~15 tokens（一樣）
 Larger model → slower inference (not more tokens)
 ```
 
----
-
-## 未來規劃 / Roadmap
-
-- [ ] **Signature verification** — HMAC per message, prevent tampering
-- [ ] **Version compatibility layer** — v1/v2 message auto-conversion
-- [ ] **State serialization** — resume execution after agent restart
-- [ ] **Multi-lobster collaboration** — agent-to-agent LCP forwarding
-- [ ] **Dynamic decision (v4)** — sandboxed runtime branching
 
 ---
 
@@ -653,8 +644,4 @@ Free to use and adapt. Attribution appreciated.
 
 ---
 
-*這隻龍蝦，是我親手養大的。—— 國裕 2026.03.14* 🦞  
 *This lobster was raised by hand. — Guoyu, 2026.03.14*
-#   l c p - l o b s t e r - v 3  
- #   l c p - l o b s t e r - v 3  
- 
