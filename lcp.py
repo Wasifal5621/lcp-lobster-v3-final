@@ -368,6 +368,10 @@ class TranslationStore:
             rows = c.execute("SELECT status,COUNT(*) cnt,AVG(confidence) ac FROM lcp_translation GROUP BY status").fetchall()
         return {r["status"]: {"count":r["cnt"],"avg_confidence":round(r["ac"],3)} for r in rows}
 
+    def close(self):
+        """關閉所有連線，清空快取（Windows 刪檔前必須呼叫）"""
+        self.hot_cache.clear()
+
     def _db_get(self, h):
         with self._conn() as c:
             return c.execute("SELECT * FROM lcp_translation WHERE input_hash=?", (h,)).fetchone()
@@ -536,6 +540,15 @@ class OllamaHandler:
                   "格式：L|CMD|param1|param2|E\nCMD 只能是：CA MB SK RM RP EA\n"
                   "例：查天氣→L|CA|openweather|taipei|E 發文→L|MB|標題|內容|E")
         return self.chat(text, system=system)
+
+    def lcp_to_natural(self, lcp_result: str, context: str = "") -> OllamaResponse:
+        """把 LCP 格式的 RP 結果翻譯成自然語言（混合模式核心）"""
+        ctx = f"背景：{context}\n" if context else ""
+        system = ("你是輸出轉譯器。把以下 LCP 格式結果轉成自然、親切的中文。\n"
+                  "規則：只輸出翻譯後的文字，不要解釋格式，不要加前綴。\n"
+                  "範例：L|RP|status:ok|source:openweather|city:taipei|data:晴天28度|E\n"
+                  "→ 今天台北天氣晴天，氣溫 28 度，很適合出門～")
+        return self.chat(f"{ctx}請翻譯：{lcp_result}", system=system)
 
     def lcp_social_reply(self, post_content: str, context: str = "") -> OllamaResponse:
         ctx = f"相關背景：{context}\n" if context else ""
@@ -863,7 +876,9 @@ class Translator:
         if result: return result
         lcp, conf = self._rules(raw)
         source = "rule"
-        if conf < 0.7 and self.ollama.is_available():
+        # 如果輸入太短或全是符號，直接跳過 Ollama（避免卡住）
+        cleaned = re.sub(r"[^\w]", "", raw)
+        if conf < 0.7 and len(cleaned) >= 2 and self.ollama.is_available():
             resp = self.ollama.lcp_translate(raw)
             if resp.success and _parse_lcp(resp.content):
                 lcp, conf, source = resp.content.strip(), 0.75, "ollama"
@@ -898,6 +913,7 @@ class ExecutionResult:
     success: bool; output: str; ea_output: str
     sandbox: Optional[SandboxResult] = None
     error: Optional[str] = None
+    natural_output: Optional[str] = None   # 混合模式：自然語言翻譯結果
 
 def _parse_lcp(raw: str) -> Optional[LCPMessage]:
     raw = raw.strip()
@@ -911,8 +927,13 @@ def _parse_lcp(raw: str) -> Optional[LCPMessage]:
     if cmd not in VALID_CMDS: return None
     return LCPMessage(cmd, parts[1:], raw)
 
+class OutputMode(Enum):
+    LCP     = "lcp"       # 純 LCP 輸出（內部用）
+    NATURAL = "natural"   # 純自然語言輸出
+    HYBRID  = "hybrid"    # 內部 LCP + 對外自然語言
+
 class LCPParser:
-    def __init__(self):
+    def __init__(self, output_mode: str = "lcp"):
         pf   = get_platform()
         db   = str(pf.db_dir / "translation.db")
         self.store      = TranslationStore(db)
@@ -921,13 +942,123 @@ class LCPParser:
         self.sandbox    = Sandbox()
         self.moltbook   = self._init_mb()
         self.watcher    = MoltbookWatcher()
+        self.output_mode = OutputMode(output_mode)
         print(f"[LCP] 平台：{pf.description}")
         print(f"[LCP] Ollama：{'✅' if self.ollama.is_available() else '❌ 離線'}")
         print(f"[LCP] Moltbook：{'✅' if self.moltbook else '⚠️  未設定 Token'}")
+        print(f"[LCP] 輸出模式：{self.output_mode.value}")
 
     def _init_mb(self):
         try:    return MoltbookHandler()
         except: return None
+
+    def _translate_output(self, lcp_output: str, context: str = "") -> str:
+        """把 LCP RP 結果翻譯成自然語言（用於混合/自然模式）"""
+        if not self.ollama.is_available():
+            # Ollama 離線時，做基礎解析
+            return self._fallback_translate(lcp_output)
+        resp = self.ollama.lcp_to_natural(lcp_output, context)
+        if resp.success and resp.content.strip():
+            return resp.content.strip()
+        return self._fallback_translate(lcp_output)
+
+    def _fallback_translate(self, lcp_output: str) -> str:
+        """Ollama 離線時的基礎 LCP→自然語言解析"""
+        # 從 RP 裡提取關鍵欄位
+        pairs = {}
+        if lcp_output.startswith("L|RP|") and lcp_output.endswith("|E"):
+            fields = lcp_output[5:-2].split("|")
+            for f in fields:
+                if ":" in f:
+                    k, v = f.split(":", 1)
+                    pairs[k] = v
+        if not pairs:
+            return lcp_output
+        status = pairs.get("status", "unknown")
+        if status == "err":
+            code = pairs.get("code", "未知錯誤")
+            return f"執行失敗：{code}"
+        # 組合有意義的欄位
+        parts = []
+        for k, v in pairs.items():
+            if k in ("status",): continue
+            parts.append(f"{k}: {v}")
+        return "執行完成。" + ("  ".join(parts) if parts else "")
+
+    def run_hybrid(self, chain: list, context: str = "") -> ExecutionResult:
+        """混合模式：內部用 LCP 執行，最終輸出自然語言"""
+        # 第一步：正常跑 LCP chain
+        result = self.run_chain(chain) if len(chain) > 1 else self.run(chain[0])
+        if not result.success:
+            result.natural_output = self._translate_output(result.output, context)
+            return result
+        # 第二步：翻譯最終 RP 結果
+        result.natural_output = self._translate_output(result.output, context)
+        return result
+
+    def run_hybrid_mb(self, chain: list, context: str = "") -> ExecutionResult:
+        """混合模式 + Moltbook：內部 LCP 執行，MB 發文自動轉自然語言
+        
+        流程：
+        1. 執行 chain 中非 MB 的指令（CA、SK、RM 等）
+        2. 遇到 MB 指令時，先把內容翻譯成自然語言
+        3. 用翻譯後的內容發到 Moltbook
+        4. SK 存原始 LCP 結果，MB 發人話版本
+        """
+        if not chain:
+            return ExecutionResult(False, "", "", error="empty_chain")
+
+        results = []; last = ""; natural_parts = []
+        mb_indices = []
+
+        # 先掃描哪些是 MB 指令
+        for i, raw in enumerate(chain):
+            msg = _parse_lcp(raw)
+            if msg and msg.cmd == "MB":
+                mb_indices.append(i)
+
+        for i, raw in enumerate(chain):
+            msg = _parse_lcp(raw)
+            if not msg:
+                results.append(LayerResult(i+1, raw, "err", "PARSE_ERROR", "?"))
+                break
+
+            if msg.cmd == "MB" and self.moltbook:
+                # 把 MB 的內容翻譯成自然語言再發
+                post = parse_mb_params(msg.params)
+                if last and "status:ok" in last:
+                    # 用前面的 RP 結果當翻譯上下文
+                    natural_content = self._translate_output(last, context)
+                    post.content = natural_content
+                elif post.content:
+                    # 如果內容本身是 LCP 格式，翻譯它
+                    if post.content.startswith("L|") or "|" in post.content:
+                        post.content = self._translate_output(post.content, context)
+                r = self.moltbook.post(post)
+                out = f"L|RP|status:ok|post_id:{r.post_id}|verified:{r.verified}|natural:true|E" \
+                      if r.success else f"L|RP|status:err|code:{r.error}|E"
+                status = "ok" if r.success else "err"
+                results.append(LayerResult(i+1, raw, status, out, msg.cmd))
+                natural_parts.append(f"已發文到 {post.submolt_name}：{post.title}")
+                last = out
+            else:
+                out    = self._dispatch(msg)
+                status = "ok" if "status:err" not in out else "err"
+                results.append(LayerResult(i+1, raw, status, out, msg.cmd))
+                last = out
+
+        # 沙盒驗證
+        sb = self.sandbox.validate_chain(chain, results)
+        for r in results:
+            self.store.apply_ea_feedback(r.lcp_input, sb.ea_type)
+
+        result = ExecutionResult(sb.passed, last, sb.ea_output, sb)
+        # 組合自然語言摘要
+        if natural_parts:
+            result.natural_output = "  ".join(natural_parts)
+        else:
+            result.natural_output = self._translate_output(last, context)
+        return result
 
     def run(self, raw: str) -> ExecutionResult:
         msg = _parse_lcp(raw)
@@ -1259,7 +1390,9 @@ def run_tests():
     r2 = store.lookup("test_ea")
     S.check(r2 and r2.confidence > 0.75, "EA reward → confidence 上升")
     S.check(isinstance(store.stats(),dict), "stats() 正常回傳")
-    os.unlink(db_path)
+    store.close()
+    try: os.unlink(db_path)
+    except OSError: pass
 
     # ── 5. 平台偵測 ────────────────────────────────────────
     _head("5. 平台偵測測試")
@@ -1306,6 +1439,7 @@ def run_tests():
     p.translator = Translator(p.store, p.ollama)
     p.sandbox    = Sandbox()
     p.watcher    = MoltbookWatcher()
+    p.output_mode = OutputMode.LCP
 
     r = p.run("L|CA|openweather|taipei|E")
     S.check(r.success and "openweather" in r.output, "單條 CA 執行")
@@ -1322,7 +1456,32 @@ def run_tests():
     r = p.run_natural("!@#$%^&*()")
     S.check(not r.success and r.error=="low_confidence", "低信心輸入被拒")
 
-    os.unlink(db2)
+    # ── 8. 混合模式測試 ────────────────────────────────────
+    _head("8. 混合模式測試")
+
+    # run_hybrid 單條指令
+    r = p.run_hybrid(["L|CA|openweather|taipei|E"])
+    S.check(r.success and r.natural_output is not None, "hybrid 單條：有 natural_output")
+
+    # run_hybrid 多條鏈
+    r = p.run_hybrid(["L|CA|openweather|taipei|E","L|SK|weather_today|晴天28度|E","L|RM|last|E"])
+    S.check(r.success and r.natural_output is not None, "hybrid 3層鏈：有 natural_output")
+
+    # fallback 翻譯測試（不經 Ollama）
+    fb = p._fallback_translate("L|RP|status:ok|source:openweather|city:taipei|data:晴天28度|E")
+    S.check("執行完成" in fb and "taipei" in fb, "fallback 翻譯：解析 RP 欄位")
+
+    fb_err = p._fallback_translate("L|RP|status:err|code:NO_TOKEN|E")
+    S.check("失敗" in fb_err and "NO_TOKEN" in fb_err, "fallback 翻譯：錯誤訊息")
+
+    # OutputMode enum
+    S.check(OutputMode("lcp") == OutputMode.LCP, "OutputMode: lcp")
+    S.check(OutputMode("hybrid") == OutputMode.HYBRID, "OutputMode: hybrid")
+    S.check(OutputMode("natural") == OutputMode.NATURAL, "OutputMode: natural")
+
+    p.store.close()
+    try: os.unlink(db2)
+    except OSError: pass
     os.environ.pop("MOLTBOOK_API_KEY", None)
     _platform_cache = _orig
 
@@ -1376,6 +1535,25 @@ def main():
         print(f"ea_output: {r.ea_output}")
         if r.sandbox: print(f"state:     {r.sandbox.state}")
 
+    elif cmd == "hybrid":
+        if len(args) < 2:
+            print("用法：python lcp.py hybrid 'L|CA|x|E' 'L|SK|k|v|E' 'L|MB|g|t|b|E'")
+            print("  混合模式：內部 LCP 執行，最終輸出自然語言")
+            print("  加 --mb 旗標：MB 發文內容也自動轉自然語言")
+            sys.exit(1)
+        use_mb = "--mb" in args
+        chain  = [a for a in args[1:] if a != "--mb"]
+        parser = LCPParser(output_mode="hybrid")
+        if use_mb:
+            r = parser.run_hybrid_mb(chain)
+        else:
+            r = parser.run_hybrid(chain)
+        print(f"success:        {r.success}")
+        print(f"lcp_output:     {r.output}")
+        print(f"natural_output: {r.natural_output}")
+        print(f"ea_output:      {r.ea_output}")
+        if r.sandbox: print(f"state:          {r.sandbox.state}")
+
     elif cmd == "chat":
         if len(args) < 2:
             print("用法：python lcp.py chat '查台北天氣'")
@@ -1414,6 +1592,8 @@ def main():
   python lcp.py test               執行完整測試套件
   python lcp.py run <LCP訊息>      執行單條指令
   python lcp.py chain <訊息...>    執行指令鏈
+  python lcp.py hybrid <訊息...>   混合模式（內部LCP→對外自然語言）
+  python lcp.py hybrid --mb <...>  混合+MB（發文內容自動轉自然語言）
   python lcp.py chat <自然語言>    自然語言轉譯執行
   python lcp.py home               查看 Moltbook 首頁
   python lcp.py decode <挑戰文字>  解碼驗證挑戰
