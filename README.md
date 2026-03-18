@@ -27,6 +27,8 @@ AGENT_READ: true
 11. [快速開始 / Quick Start](#快速開始--quick-start)
 12. [故障排除 / Troubleshooting](#故障排除--troubleshooting)
 13. [專案結構 / Project Structure](#專案結構--project-structure)
+14. [混合模式 / Hybrid Mode](#混合模式--hybrid-mode)
+15. [記憶庫 / Memory Store](#記憶庫--memory-store-v32)
 
 ---
 
@@ -541,23 +543,24 @@ status:uncertain|confidence:x  → translation confidence too low
 ## 專案結構 / Project Structure
 
 ```
-lcp.py  (single file, 1416 lines)
+lcp.py  (single file, ~2080 lines)
 │
 ├── §1   Constants & utilities
 ├── §2   Platform adapter       ← auto-detects macOS / WSL / Windows
 ├── §3   Challenge solver       ← obfuscated math auto-decode
 ├── §4   Translation store      ← SQLite + hot cache + lifecycle
+├── §4b  Memory store           ← SQLite persistent + dual-layer + auto-context
 ├── §5   Sandbox                ← state machine + EA loop
-├── §6   Ollama handler         ← local model calls
+├── §6   Ollama handler         ← local model calls + summarize + translate
 ├── §7   Moltbook watcher       ← API version tracking
 ├── §8   Moltbook handler       ← full official API implementation
 ├── §9   Translator             ← natural language → LCP
-├── §10  LCP parser             ← main entry point
+├── §10  LCP parser             ← main entry + hybrid + auto-context matching
 ├── §11  Setup tool             ← interactive setup wizard
-├── §12  Test suite             ← 45/46 pass
+├── §12  Test suite             ← 85/86 pass (includes memory + hybrid tests)
 └── §13  CLI                    ← python3 lcp.py <cmd>
 
-LCP_README.md    ← this file (human + agent readable)
+README.md    ← this file (human + agent readable)
 ```
 
 ---
@@ -634,6 +637,229 @@ L|CA|openweather|taipei|E   ← 7B 跑：~15 tokens（一樣）
 Larger model → slower inference (not more tokens)
 ```
 
+---
+
+## 混合模式 / Hybrid Mode
+
+> **v3.1 新功能** — 解決「內部省 token，對外別人看不懂」的核心矛盾  
+> **v3.1 New** — Solves the core conflict: save tokens internally, but be readable externally
+
+### 問題 / The Problem
+
+```
+純 LCP 輸出（別人看不懂）:
+  L|RP|status:ok|source:openweather|city:taipei|data:晴天28度|E
+
+混合模式輸出（人類看得懂）:
+  今天台北天氣晴天，氣溫 28 度，很適合出門～
+```
+
+### 三種輸出模式 / Three Output Modes
+
+| 模式 / Mode | 內部處理 | 對外輸出 | 適用場景 |
+|---|---|---|---|
+| `lcp` (預設) | LCP | LCP | 純內部、龍蝦對龍蝦 |
+| `natural` | LCP | 自然語言 | 回覆人類 |
+| `hybrid` | LCP | 自然語言 + MB 自動翻譯 | 上 Moltbook 發文 |
+
+### 流程圖 / Flow Diagram
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Input      │     │   Internal   │     │   Output     │
+│  (LCP 指令)  │────▶│  LCP 執行    │────▶│  自然語言    │
+│              │     │  CA/SK/RM    │     │  (7B 翻譯)   │
+└──────────────┘     └──────┬───────┘     └──────────────┘
+                            │
+                     ┌──────▼───────┐
+                     │  SK 記憶庫    │  ← 存原始 LCP 結果
+                     │  (保留完整   │
+                     │   LCP 格式)  │
+                     └──────┬───────┘
+                            │
+                     ┌──────▼───────┐
+                     │  MB 發文     │  ← 發翻譯後的自然語言
+                     │  (人話版本)  │
+                     └──────────────┘
+```
+
+### 使用方法 / Usage
+
+```bash
+# 基礎混合模式：內部 LCP，輸出自然語言
+python3 lcp.py hybrid \
+  'L|CA|openweather|taipei|E' \
+  'L|SK|weather_today|晴天28度|E' \
+  'L|RM|last|E'
+
+# 輸出：
+#   lcp_output:     L|RP|status:ok|key:last|value:stub|E
+#   natural_output: 執行完成。key: last  value: stub
+
+# 混合 + Moltbook（MB 發文自動轉自然語言）
+python3 lcp.py hybrid --mb \
+  'L|CA|openweather|taipei|E' \
+  'L|SK|weather_today|晴天28度|E' \
+  'L|MB|general|今日天氣|晴天28度|E'
+
+# SK 存的是：weather_today = 晴天28度（原始 LCP）
+# MB 發的是：「今天台北天氣晴天，氣溫 28 度～」（自然語言）
+```
+
+### 程式碼整合 / Code Integration
+
+```python
+from lcp import LCPParser
+
+# 初始化混合模式
+parser = LCPParser(output_mode="hybrid")
+
+# 方法 1：run_hybrid — 內部 LCP，最終翻譯
+r = parser.run_hybrid(["L|CA|openweather|taipei|E"])
+print(r.output)          # L|RP|status:ok|...|E  （內部 LCP）
+print(r.natural_output)  # 今天台北天氣晴天...    （對外自然語言）
+
+# 方法 2：run_hybrid_mb — MB 發文自動翻譯
+r = parser.run_hybrid_mb([
+    "L|CA|openweather|taipei|E",
+    "L|SK|weather_today|晴天28度|E",
+    "L|MB|general|今日天氣|晴天28度|E",
+])
+# SK 記錄原始 LCP → MB 發出人話版本
+```
+
+### 翻譯層設計 / Translation Layer
+
+```
+有 Ollama（在線）:
+  LCP RP 結果 → 7B 模型翻譯 → 自然語言
+  prompt 極短（~30 token），不會吃掉省下的 token
+
+無 Ollama（離線）:
+  LCP RP 結果 → fallback 解析器 → 基礎自然語言
+  自動提取 RP 欄位，組合成可讀文字
+  例：L|RP|status:ok|city:taipei|data:晴天28度|E
+    → 「執行完成。city: taipei  data: 晴天28度」
+```
+
+### 為什麼這樣設計 / Design Rationale
+
+```
+Input → LCP(內部) → AI → 自然語言 Output(對外)
+
+✅ 內部省 token（LCP 壓縮 ~55%）
+✅ 對外看得懂（自然語言輸出）
+✅ SK 記憶庫保留原始 LCP（未來龍蝦互通用）
+✅ 翻譯 prompt 極短（不浪費省下的 token）
+✅ Ollama 離線時自動 fallback（不會卡住）
+```
+
+---
+
+## 記憶庫 / Memory Store (v3.2)
+
+> **v3.2 新功能** — SK/RM 真正持久化 + 雙層存儲 + 自動相關性匹配  
+> **v3.2 New** — Real SQLite persistence + dual-layer storage + auto-context matching
+
+### 架構總覽 / Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│            MemoryStore (SQLite)              │
+│                                             │
+│  key | value(原文) | summary(摘要) | tags   │
+│                                             │
+│  ┌─────────┐  ┌──────────┐  ┌───────────┐  │
+│  │ SK 寫入  │  │ RM 讀取   │  │ 自動匹配  │  │
+│  │ +AI摘要  │  │ 摘要優先  │  │ 按需載入  │  │
+│  └─────────┘  └──────────┘  └───────────┘  │
+└─────────────────────────────────────────────┘
+```
+
+### 雙層存儲 / Dual-Layer Storage
+
+```
+存入 300 字的會議記錄：
+  L|SK|meeting:0318|今天的會議討論了...(300字)|meeting,notes|E
+
+  → 原文完整保留在 SQLite（備查用）
+  → 7B 自動生成摘要：「3/18會議：討論AI部署、預算+15%、下週三跟進」
+  → Ollama 離線時：格式壓縮（去空白截斷 200 字）
+
+讀取摘要（省 token）：
+  L|RM|meeting:0318|E
+  → summary:3/18會議：討論AI部署、預算+15%、下週三跟進
+
+讀取原文（需要細節時）：
+  L|RM|full:meeting:0318|E
+  → value:今天的會議討論了...(完整 300 字)
+```
+
+### 自動相關性匹配 / Auto-Context Matching
+
+```
+記憶庫有 100 筆記憶（平均 200 字 = 20,000 字 context）
+
+龍蝦執行 chain 時：
+  1. 從指令參數自動提取關鍵字
+  2. 搜尋記憶庫（key + value + summary + tags）
+  3. 只撈 5 筆相關摘要注入 context（~500 字）
+
+壓縮比：20,000 → 500 = 40x
+
+類似 code-review-graph 的概念：
+  不是壓縮文字，是只載入相關的東西
+```
+
+### RM 特殊指令 / RM Special Commands
+
+```
+L|RM|key|E                → 讀取（有摘要回摘要，沒有回截斷原文）
+L|RM|full:key|E           → 讀取完整原文
+L|RM|search:關鍵字|E      → 搜尋記憶庫
+L|RM|list:|E              → 列出所有 key
+L|RM|list:recipe:|E       → 列出 recipe: 開頭的 key
+L|RM|delete:key|E         → 刪除記憶
+L|RM|stats|E              → 記憶庫統計
+```
+
+### CLI 記憶庫操作 / CLI Memory Commands
+
+```bash
+# 存入記憶
+python3 lcp.py mem save weather_today "台北晴天28度" "weather,taipei"
+
+# 讀取記憶
+python3 lcp.py mem get weather_today
+
+# 搜尋
+python3 lcp.py mem search "天氣"
+
+# 列出所有
+python3 lcp.py mem list
+
+# 列出特定前綴
+python3 lcp.py mem list recipe:
+
+# 刪除
+python3 lcp.py mem delete weather_today
+
+# 統計
+python3 lcp.py mem stats
+```
+
+---
+
+## 未來規劃 / Roadmap
+
+- [x] **Hybrid output mode (v3.1)** — internal LCP + external natural language
+- [x] **Persistent memory store (v3.2)** — real SQLite SK/RM + dual-layer + auto-context
+- [ ] **Memory layering (v3.3)** — core/daily/cache tiers + temporal decay (inspired by Adam Framework)
+- [ ] **Signature verification** — HMAC per message, prevent tampering
+- [ ] **Version compatibility layer** — v1/v2 message auto-conversion
+- [ ] **State serialization** — resume execution after agent restart
+- [ ] **Multi-lobster collaboration** — agent-to-agent LCP forwarding
+- [ ] **Dynamic decision (v4)** — sandboxed runtime branching
 
 ---
 
@@ -644,4 +870,10 @@ Free to use and adapt. Attribution appreciated.
 
 ---
 
-*This lobster was raised by hand. — Guoyu, 2026.03.14*
+*這隻龍蝦，是我親手養大的。—— 國裕 2026.03.18* 🦞  
+*This lobster was raised by hand. — Guoyu, 2026.03.18*
+#   l c p - l o b s t e r - v 3 
+ 
+ #   l c p - l o b s t e r - v 3 
+ 
+ 

@@ -402,6 +402,186 @@ class TranslationStore:
 
 
 # ══════════════════════════════════════════════════════════
+# §4b  記憶庫 (MemoryStore) — SK/RM 持久化 + 知識索引
+# ══════════════════════════════════════════════════════════
+
+@dataclass
+class MemoryRecord:
+    key: str; value: str; summary: str; tags: str
+    created_at: str; updated_at: str; access_count: int
+
+class MemoryStore:
+    """SK/RM 的真正後端：SQLite 持久化、知識索引、雙層存儲（摘要+原文）"""
+
+    MAX_VALUE_LEN = 4096   # 支援長內容（筆記、對話摘要）
+    MAX_KEY_LEN   = 128
+    SUMMARY_THRESHOLD = 150  # 超過此字數時觸發 AI 摘要
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with self._conn() as c:
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS lcp_memory (
+                    key       TEXT PRIMARY KEY,
+                    value     TEXT NOT NULL,
+                    summary   TEXT DEFAULT '',
+                    tags      TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    access_count INTEGER DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_mem_tags
+                    ON lcp_memory(tags);
+            """)
+            # schema 升級：如果舊表沒有 summary 欄位就加上
+            try:
+                c.execute("SELECT summary FROM lcp_memory LIMIT 1")
+            except sqlite3.OperationalError:
+                c.execute("ALTER TABLE lcp_memory ADD COLUMN summary TEXT DEFAULT ''")
+
+    def _conn(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.db_path)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def save(self, key: str, value: str, tags: str = "", summary: str = "") -> tuple:
+        """寫入或更新記憶。回傳 (success: bool, reason: str)"""
+        if not re.match(r"^[a-z0-9_:\-\.]+$", key):
+            return False, "INVALID_KEY"
+        if len(key) > self.MAX_KEY_LEN:
+            return False, "KEY_TOO_LONG"
+        if len(value) > self.MAX_VALUE_LEN:
+            return False, "VALUE_TOO_LONG"
+        if re.search(r"L\|[A-Z]{2}\|", value):
+            return False, "MEMORY_POISON"
+        ts = _now()
+        with self._conn() as c:
+            c.execute("""INSERT INTO lcp_memory (key,value,summary,tags,created_at,updated_at,access_count)
+                         VALUES(?,?,?,?,?,?,0)
+                         ON CONFLICT(key) DO UPDATE SET
+                             value=excluded.value,
+                             summary=excluded.summary,
+                             tags=excluded.tags,
+                             updated_at=excluded.updated_at,
+                             access_count=access_count+1""",
+                      (key, value, summary, tags, ts, ts))
+        return True, "saved"
+
+    def needs_summary(self, value: str) -> bool:
+        """判斷是否需要 AI 摘要（超過門檻字數）"""
+        return len(value) > self.SUMMARY_THRESHOLD
+
+    def recall(self, key: str) -> Optional[MemoryRecord]:
+        """讀取單條記憶"""
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM lcp_memory WHERE key=?", (key,)).fetchone()
+            if not row: return None
+            c.execute("UPDATE lcp_memory SET access_count=access_count+1,updated_at=? WHERE key=?",
+                      (_now(), key))
+        return MemoryRecord(row["key"], row["value"], row["summary"] or "",
+                            row["tags"], row["created_at"], row["updated_at"],
+                            row["access_count"])
+
+    def search(self, query: str, limit: int = 5) -> list:
+        """關鍵字搜尋 + 時間衰減排序
+        
+        排序邏輯（借鑑 Adam Framework）：
+        - core 標籤的記憶永遠排最前
+        - 其他記憶按「時間衰減分數」排序：越新的分數越高
+        - 同時間的按 access_count 排
+        """
+        query = query.strip().lower()
+        if not query:
+            return []
+        words = query.split()
+        conditions = []
+        params = []
+        for w in words:
+            conditions.append("(LOWER(key) LIKE ? OR LOWER(value) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(tags) LIKE ?)")
+            params.extend([f"%{w}%", f"%{w}%", f"%{w}%", f"%{w}%"])
+        # 時間衰減排序：core 優先，然後按更新時間降序
+        sql = (f"SELECT *, "
+               f"CASE WHEN LOWER(tags) LIKE '%core%' THEN 1 ELSE 0 END AS is_core "
+               f"FROM lcp_memory WHERE {' AND '.join(conditions)} "
+               f"ORDER BY is_core DESC, updated_at DESC, access_count DESC LIMIT ?")
+        params.append(limit)
+        with self._conn() as c:
+            rows = c.execute(sql, params).fetchall()
+        return [MemoryRecord(r["key"], r["value"], r["summary"] or "",
+                             r["tags"], r["created_at"], r["updated_at"],
+                             r["access_count"])
+                for r in rows]
+
+    def get_core_memories(self, limit: int = 10) -> list:
+        """取得所有 core 標籤的記憶（永遠優先載入）"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM lcp_memory WHERE LOWER(tags) LIKE '%core%' ORDER BY updated_at DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [MemoryRecord(r["key"], r["value"], r["summary"] or "",
+                             r["tags"], r["created_at"], r["updated_at"],
+                             r["access_count"])
+                for r in rows]
+
+    def export_core(self) -> str:
+        """匯出核心記憶成 markdown（災難恢復用，借鑑 Adam 的 SOUL.md 概念）"""
+        cores = self.get_core_memories(limit=50)
+        if not cores:
+            return "# LCP 核心記憶匯出\n\n（空）\n"
+        lines = [
+            f"# LCP 核心記憶匯出",
+            f"# 匯出時間：{_now()}",
+            f"# 筆數：{len(cores)}",
+            "",
+            "---",
+            "",
+        ]
+        for r in cores:
+            lines.append(f"## {r.key}")
+            lines.append(f"**tags:** {r.tags}  |  **access:** {r.access_count}  |  **updated:** {r.updated_at}")
+            if r.summary:
+                lines.append(f"\n**摘要：** {r.summary}")
+            lines.append(f"\n{r.value}")
+            lines.append("\n---\n")
+        return "\n".join(lines)
+
+    def cleanup_expired(self, max_age_days: int = 90) -> int:
+        """清理過期的非核心記憶（cache/daily 標籤）"""
+        cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM lcp_memory WHERE LOWER(tags) NOT LIKE '%core%' AND updated_at < ? AND access_count < 3",
+                (cutoff,))
+        return cur.rowcount
+
+    def delete(self, key: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM lcp_memory WHERE key=?", (key,))
+        return cur.rowcount > 0
+
+    def list_keys(self, prefix: str = "", limit: int = 20) -> list:
+        with self._conn() as c:
+            if prefix:
+                rows = c.execute("SELECT key,tags,access_count FROM lcp_memory WHERE key LIKE ? ORDER BY updated_at DESC LIMIT ?",
+                                 (f"{prefix}%", limit)).fetchall()
+            else:
+                rows = c.execute("SELECT key,tags,access_count FROM lcp_memory ORDER BY updated_at DESC LIMIT ?",
+                                 (limit,)).fetchall()
+        return [{"key": r["key"], "tags": r["tags"], "access_count": r["access_count"]} for r in rows]
+
+    def stats(self) -> dict:
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) cnt, SUM(access_count) total_access FROM lcp_memory").fetchone()
+        return {"count": row["cnt"], "total_access": row["total_access"] or 0}
+
+    def close(self):
+        pass  # sqlite3 with-statement 自動關閉
+
+
+# ══════════════════════════════════════════════════════════
 # §5  沙盒驗證層 (Sandbox)
 # ══════════════════════════════════════════════════════════
 
@@ -549,6 +729,12 @@ class OllamaHandler:
                   "範例：L|RP|status:ok|source:openweather|city:taipei|data:晴天28度|E\n"
                   "→ 今天台北天氣晴天，氣溫 28 度，很適合出門～")
         return self.chat(f"{ctx}請翻譯：{lcp_result}", system=system)
+
+    def lcp_summarize(self, text: str, max_len: int = 100) -> OllamaResponse:
+        """把長文壓縮成重點摘要（記憶庫雙層存儲用）"""
+        system = (f"你是極致壓縮摘要器。把以下內容壓縮成{max_len}字以內的重點摘要。\n"
+                  "規則：只輸出摘要，不加前綴、不解釋、不廢話。保留關鍵數字和名詞。")
+        return self.chat(f"請摘要：\n{text}", system=system)
 
     def lcp_social_reply(self, post_content: str, context: str = "") -> OllamaResponse:
         ctx = f"相關背景：{context}\n" if context else ""
@@ -914,6 +1100,7 @@ class ExecutionResult:
     sandbox: Optional[SandboxResult] = None
     error: Optional[str] = None
     natural_output: Optional[str] = None   # 混合模式：自然語言翻譯結果
+    memory_context: Optional[str] = None   # 自動撈到的相關記憶
 
 def _parse_lcp(raw: str) -> Optional[LCPMessage]:
     raw = raw.strip()
@@ -936,16 +1123,20 @@ class LCPParser:
     def __init__(self, output_mode: str = "lcp"):
         pf   = get_platform()
         db   = str(pf.db_dir / "translation.db")
+        mem_db = str(pf.db_dir / "memory.db")
         self.store      = TranslationStore(db)
+        self.memory     = MemoryStore(mem_db)
         self.ollama     = OllamaHandler()
         self.translator = Translator(self.store, self.ollama)
         self.sandbox    = Sandbox()
         self.moltbook   = self._init_mb()
         self.watcher    = MoltbookWatcher()
         self.output_mode = OutputMode(output_mode)
+        mem_stats = self.memory.stats()
         print(f"[LCP] 平台：{pf.description}")
         print(f"[LCP] Ollama：{'✅' if self.ollama.is_available() else '❌ 離線'}")
         print(f"[LCP] Moltbook：{'✅' if self.moltbook else '⚠️  未設定 Token'}")
+        print(f"[LCP] 記憶庫：{mem_stats['count']} 筆記憶")
         print(f"[LCP] 輸出模式：{self.output_mode.value}")
 
     def _init_mb(self):
@@ -987,13 +1178,18 @@ class LCPParser:
 
     def run_hybrid(self, chain: list, context: str = "") -> ExecutionResult:
         """混合模式：內部用 LCP 執行，最終輸出自然語言"""
+        # 自動撈相關記憶
+        mem_ctx = self._auto_context(chain)
+        full_ctx = f"{context} {mem_ctx}".strip() if mem_ctx else context
         # 第一步：正常跑 LCP chain
         result = self.run_chain(chain) if len(chain) > 1 else self.run(chain[0])
         if not result.success:
-            result.natural_output = self._translate_output(result.output, context)
+            result.natural_output = self._translate_output(result.output, full_ctx)
+            result.memory_context = mem_ctx or None
             return result
-        # 第二步：翻譯最終 RP 結果
-        result.natural_output = self._translate_output(result.output, context)
+        # 第二步：翻譯最終 RP 結果（帶記憶 context 讓翻譯更精準）
+        result.natural_output = self._translate_output(result.output, full_ctx)
+        result.memory_context = mem_ctx or None
         return result
 
     def run_hybrid_mb(self, chain: list, context: str = "") -> ExecutionResult:
@@ -1060,6 +1256,47 @@ class LCPParser:
             result.natural_output = self._translate_output(last, context)
         return result
 
+    def _auto_context(self, chain: list) -> str:
+        """自動相關性匹配 + 核心記憶優先載入
+        
+        借鑑 Adam Framework 的分層概念：
+        1. core 標籤的記憶永遠載入（像 Adam 的 SOUL.md）
+        2. 再從指令參數搜尋相關記憶
+        3. 最多帶 5 筆，避免 context 爆掉
+        
+        回傳格式（極短，省 token）：
+          [CORE] key:摘要 | [MEM] key:摘要
+        """
+        if self.memory.stats()["count"] == 0:
+            return ""
+        seen_keys = set()
+        hits = []
+        # 第一步：永遠載入 core 記憶
+        cores = self.memory.get_core_memories(limit=3)
+        for r in cores:
+            seen_keys.add(r.key)
+            preview = r.summary if r.summary else (r.value[:80] if len(r.value) > 80 else r.value)
+            hits.append(f"[CORE]{r.key}:{preview}")
+        # 第二步：從 chain 提取關鍵字搜尋
+        keywords = set()
+        for raw in chain:
+            msg = _parse_lcp(raw)
+            if not msg: continue
+            for p in msg.params:
+                if len(p) < 2: continue
+                if ":" in p and any(p.startswith(x) for x in ("status","code","key")): continue
+                keywords.add(p)
+        for kw in keywords:
+            results = self.memory.search(kw, limit=3)
+            for r in results:
+                if r.key not in seen_keys:
+                    seen_keys.add(r.key)
+                    preview = r.summary if r.summary else (r.value[:80] if len(r.value) > 80 else r.value)
+                    hits.append(f"{r.key}:{preview}")
+        if not hits:
+            return ""
+        return " | ".join(hits[:5])
+
     def run(self, raw: str) -> ExecutionResult:
         msg = _parse_lcp(raw)
         if not msg:
@@ -1071,6 +1308,8 @@ class LCPParser:
         if len(chain) > MAX_DEPTH:
             return ExecutionResult(False,"L|RP|status:err|code:DEPTH_EXCEEDED|E",
                                    "L|EA|penalty|depth_exceeded|-5|E",error="depth_exceeded")
+        # 自動相關性匹配：撈相關記憶
+        mem_ctx = self._auto_context(chain)
         results = []; last = ""
         for i, raw in enumerate(chain):
             msg = _parse_lcp(raw)
@@ -1082,7 +1321,10 @@ class LCPParser:
             last = out
         sb = self.sandbox.validate_chain(chain, results)
         for r in results: self.store.apply_ea_feedback(r.lcp_input, sb.ea_type)
-        return ExecutionResult(sb.passed, last, sb.ea_output, sb)
+        result = ExecutionResult(sb.passed, last, sb.ea_output, sb)
+        if mem_ctx:
+            result.memory_context = mem_ctx
+        return result
 
     def run_natural(self, text: str) -> ExecutionResult:
         tr = self.translator.translate(text)
@@ -1144,17 +1386,65 @@ class LCPParser:
     def _sk(self, msg):
         key   = msg.params[0] if msg.params else "unknown"
         value = msg.params[1] if len(msg.params)>1 else ""
-        if re.search(r"L\|[A-Z]{2}\|", value):
-            return "L|RP|status:err|code:MEMORY_POISON|E"
-        if len(value) > 512:
-            return "L|RP|status:err|code:VALUE_TOO_LONG|E"
-        if not re.match(r"^[a-z0-9_:\-]+$", key):
-            return "L|RP|status:err|code:INVALID_KEY|E"
-        return f"L|RP|status:ok|key:{key}|saved:true|E"
+        tags  = msg.params[2] if len(msg.params)>2 else ""
+        # 長文自動摘要
+        summary = ""
+        if self.memory.needs_summary(value) and self.ollama.is_available():
+            resp = self.ollama.lcp_summarize(value)
+            if resp.success and resp.content.strip():
+                summary = resp.content.strip()[:200]
+        elif self.memory.needs_summary(value):
+            # Ollama 離線：用格式壓縮（去空白、截斷）
+            summary = re.sub(r"\s+", " ", value).strip()[:200]
+        ok, reason = self.memory.save(key, value, tags, summary)
+        if ok:
+            has_sum = "summary:yes" if summary else "summary:no"
+            return f"L|RP|status:ok|key:{key}|saved:true|{has_sum}|E"
+        return f"L|RP|status:err|code:{reason}|E"
 
     def _rm(self, msg):
         key = msg.params[0] if msg.params else "unknown"
-        return f"L|RP|status:ok|key:{key}|value:stub|E"
+        # 特殊指令：full:key → 讀取原文（不用摘要）
+        if key.startswith("full:"):
+            real_key = key[5:]
+            rec = self.memory.recall(real_key)
+            if rec:
+                return f"L|RP|status:ok|key:{real_key}|value:{rec.value}|tags:{rec.tags}|E"
+            return f"L|RP|status:ok|key:{real_key}|value:NOT_FOUND|E"
+        # 特殊指令：search:關鍵字 → 搜尋記憶庫
+        if key.startswith("search:"):
+            query = key[7:]
+            results = self.memory.search(query, limit=5)
+            if not results:
+                return f"L|RP|status:ok|key:search|found:0|E"
+            # 回傳摘要版（省 token）
+            hits = ";".join(f"{r.key}={r.summary or r.value[:60]}" for r in results)
+            return f"L|RP|status:ok|key:search|found:{len(results)}|hits:{hits}|E"
+        # 特殊指令：list: 或 list:prefix → 列出 key
+        if key.startswith("list:") or key == "list":
+            prefix = key[5:] if key.startswith("list:") else ""
+            keys = self.memory.list_keys(prefix, limit=20)
+            if not keys:
+                return f"L|RP|status:ok|key:list|count:0|E"
+            kstr = ";".join(k["key"] for k in keys)
+            return f"L|RP|status:ok|key:list|count:{len(keys)}|keys:{kstr}|E"
+        # 特殊指令：delete:key → 刪除記憶
+        if key.startswith("delete:"):
+            del_key = key[7:]
+            ok = self.memory.delete(del_key)
+            return f"L|RP|status:ok|key:{del_key}|deleted:{ok}|E"
+        # 特殊指令：stats → 記憶庫統計
+        if key == "stats":
+            s = self.memory.stats()
+            return f"L|RP|status:ok|count:{s['count']}|total_access:{s['total_access']}|E"
+        # 一般讀取：有摘要就回摘要（省 token），沒有就回原文截斷版
+        rec = self.memory.recall(key)
+        if rec:
+            if rec.summary:
+                return f"L|RP|status:ok|key:{key}|summary:{rec.summary}|has_full:true|tags:{rec.tags}|E"
+            val = rec.value if len(rec.value) <= 200 else rec.value[:197] + "..."
+            return f"L|RP|status:ok|key:{key}|value:{val}|tags:{rec.tags}|E"
+        return f"L|RP|status:ok|key:{key}|value:NOT_FOUND|E"
 
     def _rp(self, msg): return msg.raw
     def _ea(self, msg): return msg.raw
@@ -1394,6 +1684,84 @@ def run_tests():
     try: os.unlink(db_path)
     except OSError: pass
 
+    # ── 4b. MemoryStore 記憶庫測試 ─────────────────────────
+    _head("4b. MemoryStore 記憶庫測試")
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        mem_path = f.name
+    mem = MemoryStore(mem_path)
+
+    # 基本存取
+    ok, reason = mem.save("weather_today", "台北晴天28度", "weather,taipei")
+    S.check(ok and reason == "saved", "SK 寫入成功")
+    rec = mem.recall("weather_today")
+    S.check(rec and rec.value == "台北晴天28度", "RM 讀取成功")
+    S.check(rec and rec.tags == "weather,taipei", "tags 正確")
+
+    # 更新覆蓋
+    mem.save("weather_today", "台北陰天22度", "weather,taipei")
+    rec2 = mem.recall("weather_today")
+    S.check(rec2 and rec2.value == "台北陰天22度", "SK 更新覆蓋")
+
+    # 帶摘要寫入（雙層存儲）
+    long_text = "今天早上八點在台北市信義區舉辦了一場大型的科技展覽會議，來自全球各地超過五百位開發者參加了這次活動。主題涵蓋人工智慧、區塊鏈、量子計算等前沿技術。特別值得一提的是，有三家新創公司展示了他們的本地AI解決方案。"
+    ok_s, _ = mem.save("event:tech_expo", long_text, "event,taipei,tech", summary="台北信義區科技展，500+開發者，主題AI/區塊鏈/量子，3家新創展示本地AI")
+    S.check(ok_s, "帶摘要寫入成功")
+    rec_s = mem.recall("event:tech_expo")
+    S.check(rec_s and rec_s.summary != "" and "500" in rec_s.summary, "摘要讀取正確")
+    S.check(rec_s and rec_s.value == long_text, "原文完整保留")
+
+    # needs_summary 判斷
+    S.check(not mem.needs_summary("短文"), "短文不需摘要")
+    S.check(mem.needs_summary("x" * 200), "長文需要摘要")
+
+    # 長內容支援
+    long_val = "這是一篇很長的筆記。" * 200  # ~2000 字
+    ok2, _ = mem.save("long_note", long_val)
+    S.check(ok2, "長內容寫入（~2000字）")
+    rec3 = mem.recall("long_note")
+    S.check(rec3 and len(rec3.value) > 1000, "長內容讀取完整")
+
+    # 超長被拒
+    ok3, reason3 = mem.save("too_long", "x" * 5000)
+    S.check(not ok3 and reason3 == "VALUE_TOO_LONG", "超長被拒（>4096）")
+
+    # 防毒
+    ok4, reason4 = mem.save("poison", "L|CA|evil|E")
+    S.check(not ok4 and reason4 == "MEMORY_POISON", "記憶污染被拒")
+
+    # 非法 key
+    ok5, reason5 = mem.save("BAD KEY!", "test")
+    S.check(not ok5 and reason5 == "INVALID_KEY", "非法 key 被拒")
+
+    # 搜尋
+    mem.save("recipe:egg", "煎蛋：油熱，打蛋，小火煎3分鐘", "cooking,breakfast")
+    mem.save("recipe:rice", "煮飯：米洗淨，水1:1.2，電鍋跳起燜10分鐘", "cooking,staple")
+    results = mem.search("cooking")
+    S.check(len(results) >= 2, "關鍵字搜尋：cooking 命中 >=2")
+    results2 = mem.search("egg")
+    S.check(len(results2) >= 1 and results2[0].key == "recipe:egg", "關鍵字搜尋：egg 命中")
+    results3 = mem.search("不存在的東西xyz")
+    S.check(len(results3) == 0, "搜尋無結果回空")
+
+    # 列出 keys
+    keys = mem.list_keys("recipe:")
+    S.check(len(keys) >= 2, "list_keys prefix 過濾")
+    all_keys = mem.list_keys()
+    S.check(len(all_keys) >= 4, "list_keys 全部列出")
+
+    # 刪除
+    S.check(mem.delete("recipe:egg"), "刪除成功")
+    S.check(mem.recall("recipe:egg") is None, "刪除後讀取為 None")
+    S.check(not mem.delete("not_exist"), "刪除不存在回 False")
+
+    # 統計
+    s = mem.stats()
+    S.check(s["count"] >= 3, "stats 計數正確")
+
+    mem.close()
+    try: os.unlink(mem_path)
+    except OSError: pass
+
     # ── 5. 平台偵測 ────────────────────────────────────────
     _head("5. 平台偵測測試")
     pf = detect_platform()
@@ -1434,6 +1802,9 @@ def run_tests():
 
     p = LCPParser.__new__(LCPParser)
     p.store      = TranslationStore(db2)
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        mem_db2 = f.name
+    p.memory     = MemoryStore(mem_db2)
     p.ollama     = OllamaHandler()
     p.moltbook   = None
     p.translator = Translator(p.store, p.ollama)
@@ -1447,8 +1818,51 @@ def run_tests():
     r = p.run_natural("查台北天氣")
     S.check(r.success, "自然語言命中對照庫")
 
+    # SK 真正寫入測試
+    r = p.run("L|SK|test_key|hello_world|E")
+    S.check(r.success and "saved:true" in r.output, "SK 真正寫入")
+
+    # RM 真正讀取測試
+    r = p.run("L|RM|test_key|E")
+    S.check(r.success and "hello_world" in r.output, "RM 真正讀取")
+
+    # SK 長文自動摘要（Ollama 離線時用格式壓縮）
+    long_text = "今天的會議討論了很多重要的議題，" * 20  # > 150 字
+    r = p.run(f"L|SK|meeting_notes|{long_text}|E")
+    S.check(r.success and "saved:true" in r.output, "SK 長文寫入")
+
+    # RM 讀取摘要版
+    r = p.run("L|RM|meeting_notes|E")
+    S.check(r.success and ("summary:" in r.output or "value:" in r.output), "RM 讀取（摘要或截斷）")
+
+    # RM full: 讀取原文
+    r = p.run("L|RM|full:meeting_notes|E")
+    S.check(r.success and "今天" in r.output, "RM full: 讀取原文")
+
+    # RM 搜尋測試
+    r = p.run("L|RM|search:hello|E")
+    S.check(r.success and "found:" in r.output, "RM 搜尋")
+
+    # RM 列出 keys
+    r = p.run("L|RM|list:|E")
+    S.check(r.success and "count:" in r.output, "RM 列出 keys")
+
+    # RM 統計
+    r = p.run("L|RM|stats|E")
+    S.check(r.success and "count:" in r.output, "RM 統計")
+
+    # 自動相關性匹配測試
+    # 先存幾筆相關記憶
+    p.run("L|SK|taipei_info|台北市人口約260萬，是台灣首都|city,taiwan|E")
+    p.run("L|SK|weather_note|查天氣建議用openweather API|api,weather|E")
+    # 執行含 taipei 的 chain，應該自動撈到 taipei_info
     r = p.run_chain(["L|CA|openweather|taipei|E","L|SK|weather_today|晴天28度|E","L|RM|last|E"])
     S.check(r.success and r.sandbox.passed, "3層鏈沙盒通過")
+    S.check(r.memory_context is not None and "taipei" in r.memory_context.lower(), "自動相關性匹配：撈到 taipei 相關記憶")
+
+    # _auto_context 空記憶庫不報錯
+    ctx = p._auto_context(["L|CA|nonexistent_api_xyz|E"])
+    S.check(isinstance(ctx, str), "auto_context 無命中不報錯")
 
     r = p.run_chain(["L|CA|x|E"]*5)
     S.check(not r.success and r.error=="depth_exceeded", "超過4層被拒")
@@ -1480,7 +1894,10 @@ def run_tests():
     S.check(OutputMode("natural") == OutputMode.NATURAL, "OutputMode: natural")
 
     p.store.close()
+    p.memory.close()
     try: os.unlink(db2)
+    except OSError: pass
+    try: os.unlink(mem_db2)
     except OSError: pass
     os.environ.pop("MOLTBOOK_API_KEY", None)
     _platform_cache = _orig
@@ -1533,6 +1950,7 @@ def main():
         print(f"success:   {r.success}")
         print(f"output:    {r.output}")
         print(f"ea_output: {r.ea_output}")
+        if r.memory_context: print(f"memory:    {r.memory_context}")
         if r.sandbox: print(f"state:     {r.sandbox.state}")
 
     elif cmd == "hybrid":
@@ -1552,6 +1970,7 @@ def main():
         print(f"lcp_output:     {r.output}")
         print(f"natural_output: {r.natural_output}")
         print(f"ea_output:      {r.ea_output}")
+        if r.memory_context: print(f"memory:         {r.memory_context}")
         if r.sandbox: print(f"state:          {r.sandbox.state}")
 
     elif cmd == "chat":
@@ -1572,6 +1991,60 @@ def main():
         except ValueError as e:
             print(f"❌ {e}")
 
+    elif cmd == "mem":
+        # 記憶庫操作
+        if len(args) < 2:
+            print("用法：")
+            print("  python lcp.py mem save <key> <value> [tags]")
+            print("  python lcp.py mem get <key>")
+            print("  python lcp.py mem search <query>")
+            print("  python lcp.py mem list [prefix]")
+            print("  python lcp.py mem delete <key>")
+            print("  python lcp.py mem stats")
+            sys.exit(1)
+        sub = args[1].lower()
+        pf  = get_platform()
+        mem = MemoryStore(str(pf.db_dir / "memory.db"))
+        if sub == "save" and len(args) >= 4:
+            tags = args[4] if len(args) > 4 else ""
+            ok, reason = mem.save(args[2], args[3], tags)
+            print(f"{'✅' if ok else '❌'} {reason}  key={args[2]}")
+        elif sub == "get" and len(args) >= 3:
+            rec = mem.recall(args[2])
+            if rec:
+                print(f"key:     {rec.key}")
+                print(f"value:   {rec.value}")
+                print(f"tags:    {rec.tags}")
+                print(f"access:  {rec.access_count}")
+                print(f"updated: {rec.updated_at}")
+            else:
+                print(f"❌ key '{args[2]}' 不存在")
+        elif sub == "search" and len(args) >= 3:
+            results = mem.search(" ".join(args[2:]))
+            if results:
+                for r in results:
+                    val_preview = r.value[:80] + "..." if len(r.value) > 80 else r.value
+                    print(f"  {r.key}  [{r.tags}]  →  {val_preview}")
+            else:
+                print("沒有找到相關記憶")
+        elif sub == "list":
+            prefix = args[2] if len(args) > 2 else ""
+            keys = mem.list_keys(prefix)
+            if keys:
+                for k in keys:
+                    print(f"  {k['key']}  [{k['tags']}]  access:{k['access_count']}")
+            else:
+                print("記憶庫為空")
+        elif sub == "delete" and len(args) >= 3:
+            ok = mem.delete(args[2])
+            print(f"{'✅ 已刪除' if ok else '❌ 不存在'}  key={args[2]}")
+        elif sub == "stats":
+            s = mem.stats()
+            print(f"記憶總數：{s['count']}")
+            print(f"總存取次數：{s['total_access']}")
+        else:
+            print(f"未知子命令：{sub}")
+
     elif cmd == "decode":
         # 測試驗證挑戰解碼
         if len(args) < 2:
@@ -1583,7 +2056,7 @@ def main():
 
     else:
         print(f"""
-{BOLD}LCP — Lobster Communication Protocol v3{RESET}
+{BOLD}LCP — Lobster Communication Protocol v3.1{RESET}
 
 用法：
   python lcp.py setup              互動式設定
@@ -1595,6 +2068,7 @@ def main():
   python lcp.py hybrid <訊息...>   混合模式（內部LCP→對外自然語言）
   python lcp.py hybrid --mb <...>  混合+MB（發文內容自動轉自然語言）
   python lcp.py chat <自然語言>    自然語言轉譯執行
+  python lcp.py mem save/get/search/list/delete/stats  記憶庫操作
   python lcp.py home               查看 Moltbook 首頁
   python lcp.py decode <挑戰文字>  解碼驗證挑戰
 """)
